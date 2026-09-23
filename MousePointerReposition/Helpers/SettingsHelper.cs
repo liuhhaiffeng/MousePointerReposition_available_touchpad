@@ -56,6 +56,18 @@ namespace MousePointerReposition.Helper
             get { return ReadRegValue<int>(nameof(DisableManualCursorReposition)) == 1; }
             set { WriteRegValue<int>(nameof(DisableManualCursorReposition), value ? 1 : 0); }
         }
+
+        /// <summary>
+        /// Enable touchpad / system-foreground mouse cursor repositioning.
+        /// Repositions the mouse cursor when the foreground window changes via
+        /// touchpad gestures or other system-level foreground transitions
+        /// (Task View, snap assist, etc.).
+        /// </summary>
+        public bool EnableTouchpadAppSwitch
+        {
+            get { return ReadRegValue<int>(nameof(EnableTouchpadAppSwitch)) != 0; }
+            set { WriteRegValue<int>(nameof(EnableTouchpadAppSwitch), value ? 1 : 0); }
+        }
         #endregion public properties
 
 
