@@ -741,17 +741,15 @@ namespace MousePointerReposition
 
                     Debug.WriteLine(String.Format("New cursor: x={0} y={1}", x, y));
 
-                    // Win11 multi-monitor bug workaround: SetCursorPos to a window whose
-                    // rect has negative left or top (i.e. foreground is on a secondary
-                    // monitor positioned to the left of the primary) returns success
-                    // but ~9 seconds later ntdll raises an AccessViolationException that
-                    // we cannot catch from user mode. Skip the move entirely for these
-                    // targets so the platform bug stays untriggered. Same logic as the
-                    // existing Alt+Tab path in this binary; the keyboard path also uses
-                    // TryMouseRepositioning + SetCursorPos, it just usually doesn't
-                    // land on a negative-coord target because users tend to keep
-                    // Alt+Tab on the primary monitor.
-                    if (windowRect.left < 0 || windowRect.top < 0)
+                    // Win11 multi-monitor bug workaround, gated by the touchpad experiment
+                    // switch: SetCursorPos to a window whose rect has negative left or top
+                    // (foreground on a secondary monitor positioned left of/above the primary)
+                    // returns success but ~9 seconds later ntdll raises an
+                    // AccessViolationException we cannot catch. Skip the move for these
+                    // targets — but ONLY while the touchpad hook experiment is enabled, so
+                    // the keyboard paths (Alt+Tab / Win+arrows / 2x Ctrl) keep the exact
+                    // master behavior when the switch is OFF.
+                    if (EnableTouchpadAppSwitch && (windowRect.left < 0 || windowRect.top < 0))
                     {
                         App.logger.Information(
                             $"TryMouseRepositioning: skipping move, foreground window on monitor with negative coords (rect.left={windowRect.left}, rect.top={windowRect.top})");
