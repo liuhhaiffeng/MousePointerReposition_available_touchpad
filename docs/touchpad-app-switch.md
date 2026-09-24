@@ -969,10 +969,10 @@ SetWinEventHook(..., ForegroundEventCallback, ...);
 
 Win+Shift+方向键后连续手势正常跨屏跟随（零 skipped）；Alt+Tab 序列期重复事件**正确**消重（skipped 精确聚集在 Alt+Tab 的 ±2s 内）；Alt+Tab 后手势正常。
 
-### 附带发现（记录，未修）
+### 附带发现（均已修复）
 
-- **应用无单实例防护**：测试期间曾双实例同时运行（双份键盘 hook + 双份前台 hook + 同一日志文件）。master 上同样存在。建议后续加 Mutex 单实例。
-- **master 预存运算符优先级 bug**：`KeyDownHook` 里 `e.Key == Keys.Left || e.Key == Keys.Right && e.isWinPressed` 等价于"裸按 Left 也触发"。
+- **应用无单实例防护**（曾致双实例并行：双份钩子、日志分叉、启动日志丢失）→ 已加会话级 Mutex，第二实例静默退出（commit `f16c351`）
+- **master 预存运算符优先级 bug**（裸按左方向键误触发重定位序列）→ 已修，两个方向键均要求 Win（commit `8c979c1`）
 
 ## 现状与建议（v3.1 更新）
 
