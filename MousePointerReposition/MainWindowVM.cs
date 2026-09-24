@@ -418,8 +418,11 @@ namespace MousePointerReposition
             // win + shift + left or right key
             if (!DisableWinLeftRight)
             {
-                if (e.Key == Keys.Left
-                    || e.Key == Keys.Right && e.isWinPressed) // with or without shift //&& e.isShiftPressed)
+                // win + shift + left or right key (with or without shift)
+                // (master precedence bug fixed: "Left || Right && Win" evaluated as
+                // "bare Left-arrow anywhere || (Win+Right)", so e.g. pressing Left in a
+                // text editor started a repositioning sequence; both arrows now require Win)
+                if ((e.Key == Keys.Left || e.Key == Keys.Right) && e.isWinPressed)
                 {
                     App.logger.Debug("Win+Left or Win+Right");
                     TriggerMousePositioning();
