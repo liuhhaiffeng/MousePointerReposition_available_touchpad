@@ -18,8 +18,26 @@ namespace MousePointerReposition
         public static LoggingLevelSwitch loggingLevelSwitch;
         public static Logger logger;
 
+        // Single-instance guard: a second process would register a duplicate set of
+        // global hooks (double cursor moves, interleaved log writes) — observed in
+        // testing (two PIDs alive, both hooking). The mutex is checked before the
+        // logger/file sink is configured so the second instance never contends for
+        // the log file. Per-session name (no Global\ prefix) is intentional:
+        // tray app semantics are per user session. The OS reclaims the handle on
+        // process exit (crash included), so no explicit release is required.
+        private const string SingleInstanceMutexName = "MousePointerReposition.SingleInstance";
+        private static System.Threading.Mutex _singleInstanceMutex;
+
         public App()
         {
+            bool createdNew;
+            _singleInstanceMutex = new System.Threading.Mutex(true, SingleInstanceMutexName, out createdNew);
+            if (!createdNew)
+            {
+                _singleInstanceMutex = null;
+                Environment.Exit(0); // silent: tray app, existing instance stays in tray
+            }
+
             string appFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "MousePointerReposition");
             string appLogFolder = Path.Combine(appFolder, "Logs");
 
