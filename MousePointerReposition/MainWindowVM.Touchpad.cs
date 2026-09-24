@@ -56,6 +56,32 @@ namespace MousePointerReposition
 
         private RepositionTrigger ActiveTrigger { get; set; } = RepositionTrigger.Keyboard;
 
+        /// <summary>
+        /// Experiment stage captured at hook registration
+        /// (see SettingsHelper.TouchpadExperimentStage). Changing the registry
+        /// value requires an app restart to take effect.
+        /// </summary>
+        private int ExperimentStage { get; set; } = 1;
+
+        // CRITICAL: the WinEventProc delegate must be kept alive for the lifetime of
+        // the hooks. Passing the method group to SetWinEventHook directly creates an
+        // UNROOTED delegate that the GC can collect at any time; the next Win32 event
+        // then jumps into a freed thunk -> native AccessViolation -> 0xC000041D
+        // (STATUS_FATAL_USER_CALLBACK_EXCEPTION) seconds later. This unrooted-delegate
+        // pattern is the prime suspect for the delayed crashes recorded in
+        // docs/touchpad-app-switch.md (v2.0): it explains the 9-14s delay (needs a GC
+        // cycle + a subsequent event), why try-catch / DispatcherUnhandledException /
+        // e.Handled could not help (the AV is not inside our code), and why the
+        // keyboard path never crashed (FMUtils roots its hook delegate properly).
+        private Vanara.PInvoke.User32.WinEventProc ForegroundEventProcDelegate; // field: keeps the delegate alive against GC
+
+        // Diagnostic low-level keyboard hook (log-only). Reads KBDLLHOOKSTRUCT.flags
+        // so we can tell physical keystrokes from synthetic/injected ones (e.g. if the
+        // touchpad gesture stack injects Alt+Tab). Never interferes: it only logs and
+        // immediately calls CallNextHookEx. Registered only while the experiment is ON.
+        private Vanara.PInvoke.User32.SafeHHOOK DiagnosticKeyboardHook;
+        private Vanara.PInvoke.User32.HookProc DiagnosticKeyboardProcDelegate; // field: keeps the delegate alive against GC
+
         #endregion experiment state
 
         #region settings property
@@ -95,15 +121,21 @@ namespace MousePointerReposition
         /// </summary>
         private void RegisterForegroundEventHooks()
         {
-            App.logger.Debug("Foreground event hook init");
+            var stage = SettingsHelper.Instance.TouchpadExperimentStage;
+            if (stage < 1 || stage > 5) stage = 1; // 0/unset → ObserveOnly (safest)
+            ExperimentStage = stage;
+            App.logger.Information($"Foreground event hook init: EnableTouchpadAppSwitch={EnableTouchpadAppSwitch}, ExperimentStage={ExperimentStage}");
             ForegroundEventHooks = new System.Collections.Generic.List<Vanara.PInvoke.User32.HWINEVENTHOOK>();
             if (EnableTouchpadAppSwitch)
             {
+                // root the callback delegate BEFORE registering (see field comment)
+                ForegroundEventProcDelegate = ForegroundEventCallback;
+
                 var hookFront = Vanara.PInvoke.User32.SetWinEventHook(
                     Vanara.PInvoke.User32.EventConstants.EVENT_SYSTEM_FOREGROUND,
                     Vanara.PInvoke.User32.EventConstants.EVENT_SYSTEM_FOREGROUND,
                     Vanara.PInvoke.HINSTANCE.NULL,
-                    ForegroundEventCallback,
+                    ForegroundEventProcDelegate,
                     0,
                     0,
                     Vanara.PInvoke.User32.WINEVENT.WINEVENT_OUTOFCONTEXT);
@@ -116,7 +148,7 @@ namespace MousePointerReposition
                     Vanara.PInvoke.User32.EventConstants.EVENT_SYSTEM_SWITCHSTART,
                     Vanara.PInvoke.User32.EventConstants.EVENT_SYSTEM_SWITCHEND,
                     Vanara.PInvoke.HINSTANCE.NULL,
-                    ForegroundEventCallback,
+                    ForegroundEventProcDelegate,
                     0,
                     0,
                     Vanara.PInvoke.User32.WINEVENT.WINEVENT_OUTOFCONTEXT);
@@ -126,6 +158,9 @@ namespace MousePointerReposition
                     ForegroundEventHooks.Add(hookSwitch);
 
                 App.logger.Debug($"Foreground event hooks registered: {ForegroundEventHooks.Count}/2");
+
+                // diagnostic keyboard hook (log-only, observes the INJECTED flag)
+                RegisterDiagnosticKeyboardHook();
             }
             else
             {
@@ -150,6 +185,13 @@ namespace MousePointerReposition
                     }
                 }
                 ForegroundEventHooks.Clear();
+            }
+
+            if (DiagnosticKeyboardHook != null && !DiagnosticKeyboardHook.IsNull)
+            {
+                App.logger.Debug("UnhookWindowsHookEx (diagnostic keyboard hook)");
+                Vanara.PInvoke.User32.UnhookWindowsHookEx(DiagnosticKeyboardHook); // SafeHHOOK → HHOOK implicit
+                DiagnosticKeyboardHook = null;
             }
         }
 
@@ -208,6 +250,15 @@ namespace MousePointerReposition
                 LastForegroundHwnd = newHwnd;
             }
 
+            // Stage 1 (ObserveOnly): log the full event and stop — no dispatcher marshal.
+            // Lets us compare the event stream of physical Alt+Tab vs touchpad gesture
+            // without touching the WPF pipeline at all.
+            if (ExperimentStage <= 1)
+            {
+                App.logger.Information($"[Stage1-Observe] eventId=0x{eventId:X4} hwnd=0x{(hwnd.IsNull ? 0L : ((IntPtr)hwnd).ToInt64()):X} idObject={idObject} idChild={idChild} thread={idEventThread} time={dwmsEventTime}");
+                return;
+            }
+
             // marshal to UI thread
             if (System.Windows.Application.Current == null)
                 return;
@@ -220,6 +271,14 @@ namespace MousePointerReposition
                         App.logger.Debug("ForegroundEvent: skipped (disabled after marshal)");
                         return;
                     }
+                    // Stage 2 (MarshalOnly): prove the dispatcher round-trip survives,
+                    // but do not touch the repositioning pipeline.
+                    if (ExperimentStage <= 2)
+                    {
+                        App.logger.Information($"[Stage2-Marshal] dispatcher round-trip OK (eventId=0x{eventId:X4}), pipeline untouched");
+                        return;
+                    }
+
                     App.logger.Debug($"ForegroundEvent: triggering mouse positioning (eventId=0x{eventId:X4})");
 
                     // Use the MANUAL trigger path (empty "old" rectangle) because by the time
@@ -236,6 +295,45 @@ namespace MousePointerReposition
         }
 
         #endregion hook callback
+
+        #region diagnostic keyboard hook (log-only instrumentation)
+
+        /// <summary>
+        /// Registers a log-only WH_KEYBOARD_LL hook that reports the LLKHF_INJECTED
+        /// flag for every key event. This distinguishes physical keystrokes from
+        /// synthetic ones injected by the shell (e.g. if the precision-touchpad
+        /// gesture stack implements 'switch apps' by injecting Alt+Tab).
+        /// Only registered while the experiment switch is ON.
+        /// </summary>
+        private void RegisterDiagnosticKeyboardHook()
+        {
+            DiagnosticKeyboardProcDelegate = DiagnosticKeyboardProc;
+            DiagnosticKeyboardHook = Vanara.PInvoke.User32.SetWindowsHookEx(
+                Vanara.PInvoke.User32.HookType.WH_KEYBOARD_LL,
+                DiagnosticKeyboardProcDelegate,
+                Vanara.PInvoke.HINSTANCE.NULL,
+                0);
+            if (DiagnosticKeyboardHook.IsNull)
+                App.logger.Warning("[DiagKey] diagnostic keyboard hook failed to register");
+            else
+                App.logger.Information("[DiagKey] diagnostic keyboard hook registered (log-only)");
+        }
+
+        private IntPtr DiagnosticKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0)
+            {
+                var kb = System.Runtime.InteropServices.Marshal.PtrToStructure<Vanara.PInvoke.User32.KBDLLHOOKSTRUCT>(lParam);
+                var flags = kb.flags; // uint: bit0 = LLKHF_INJECTED, bit1 = LLKHF_LOWER_IL_INJECTED
+                bool injected = (flags & 0x1) != 0;          // LLKHF_INJECTED
+                bool lowerIlInjected = (flags & 0x2) != 0;   // LLKHF_LOWER_IL_INJECTED
+                App.logger.Information($"[DiagKey] vk=0x{kb.vkCode:X2} scan=0x{kb.scanCode:X2} msg=0x{wParam.ToInt64():X4} injected={injected} lowerIL={lowerIlInjected}");
+            }
+            // hhk of CallNextHookEx is ignored by the system; pass a null handle.
+            return Vanara.PInvoke.User32.CallNextHookEx(new Vanara.PInvoke.User32.HHOOK(IntPtr.Zero), nCode, wParam, lParam);
+        }
+
+        #endregion diagnostic keyboard hook (log-only instrumentation)
 
         #region experiment guard (single permitted touchpoint in the shared pipeline)
 
@@ -256,11 +354,33 @@ namespace MousePointerReposition
         {
             if (ActiveTrigger != RepositionTrigger.ForegroundHook)
                 return false;
-            if (windowRect.left >= 0 && windowRect.top >= 0)
-                return false;
-            App.logger.Information(
-                $"TryMouseRepositioning: skipping move, foreground-hook path to negative-coord monitor (rect.left={windowRect.left}, rect.top={windowRect.top})");
-            return true;
+
+            // Stage 3 (NoCursorMove): run the whole trigger/timer/geometry pipeline but
+            // suppress the actual SetCursorPos. Isolates whether the crash needs the
+            // cursor move itself or already happens in the pipeline above it.
+            if (ExperimentStage == 3)
+            {
+                App.logger.Information(
+                    $"[Stage3-NoCursorMove] would move cursor to center of rect (left={windowRect.left}, top={windowRect.top}, w={windowRect.Width}, h={windowRect.Height}), SetCursorPos suppressed");
+                return true;
+            }
+
+            // Stage 4: legacy negative-coord guard, kept for A/B. It was added when
+            // SetCursorPos to negative-coord windows was believed to trigger the delayed
+            // crash; the root cause turned out to be the unrooted WinEventProc delegate
+            // (see RegisterForegroundEventHooks), not SetCursorPos.
+            // Stage 5: no coordinate guard at all — the real verdict on whether
+            // negative-coord SetCursorPos is actually dangerous on this machine.
+            if (ExperimentStage == 4)
+            {
+                if (windowRect.left >= 0 && windowRect.top >= 0)
+                    return false;
+                App.logger.Information(
+                    $"TryMouseRepositioning: skipping move, foreground-hook path to negative-coord monitor (rect.left={windowRect.left}, rect.top={windowRect.top})");
+                return true;
+            }
+
+            return false; // Stage 5: never skip
         }
 
         #endregion experiment guard

@@ -68,6 +68,26 @@ namespace MousePointerReposition.Helper
             get { return ReadRegValue<int>(nameof(EnableTouchpadAppSwitch)) != 0; }
             set { WriteRegValue<int>(nameof(EnableTouchpadAppSwitch), value ? 1 : 0); }
         }
+
+        /// <summary>
+        /// Touchpad experiment stage — internal debugging switch (registry only, no UI).
+        /// Only consulted when EnableTouchpadAppSwitch is ON. Bisects the crashing path:
+        ///   0/unset = treated as 1 (ObserveOnly)
+        ///   1 = ObserveOnly  — foreground callback only logs event details, NO dispatcher marshal
+        ///   2 = MarshalOnly  — + Dispatcher.BeginInvoke round-trip, lambda logs and returns
+        ///   3 = NoCursorMove — + full trigger/timer/geometry pipeline, SetCursorPos suppressed
+        ///   4 = Full         — complete behavior with legacy negative-coord guard
+        ///   5 = FullNoGuard  — complete behavior WITHOUT the negative-coordinate guard
+        ///                      (the guard's premise — SetCursorPos causing the crash —
+        ///                      was disproven; root cause was the unrooted WinEventProc
+        ///                      delegate. Stage 5 is the real verdict on this machine)
+        /// Captured at hook registration; restart the app after changing.
+        /// </summary>
+        public int TouchpadExperimentStage
+        {
+            get { return ReadRegValue<int>(nameof(TouchpadExperimentStage)); }
+            set { WriteRegValue<int>(nameof(TouchpadExperimentStage), value); }
+        }
         #endregion public properties
 
 
