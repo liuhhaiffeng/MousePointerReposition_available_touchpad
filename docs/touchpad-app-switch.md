@@ -781,6 +781,7 @@ TC-E-4  ☐ 通过 ☐ 失败  备注: ___________
 | v2.1 | 守卫门控修复 | 发现 v1.12 负坐标守卫放在共用方法 `TryMouseRepositioning` 里，开关 OFF 时仍侵入 Alt+Tab 路径（跨屏失灵）；改为仅在 `EnableTouchpadAppSwitch=true` 时生效（commit `e964f03`）。详见"共用路径污染事件"章节 |
 | v2.2 | 物理隔离重构 | 触控板实验代码抽为 partial class `MainWindowVM.Touchpad.cs`；守卫从"开关门控"改为**路径（trigger）门控**——开关 ON 时键盘路径也不再被守卫拦截；新增"实验特性开发约束"与"平台风险特性开发流程"两个治理章节 |
 | **v3.0** | **根因翻案** | 崩溃根因 = **未持有的 WinEventProc 委托**（GC 回收 → 下一事件跳入已释放 thunk → 0xC000041D），两行修复（commit `126685c`）。Stage 1-5 分阶段二分实证（见"v3.0 翻案"章节）。v2.0 的"平台不可行"归因**作废**：SetCursorPos / 负坐标 / WPF Dispatcher 全部清白。清理：拆诊断键盘钩子与从不触发的 SWITCH hook、双重触发消重、档位默认全功能（commit `0d98967`）|
+| **v3.1** | **消重误杀修复** | 手势在 Win+Shift+方向键后永久失效：消重条件引用被手势路径污染的粘性标志 → 永久锁定。剔除泄漏标志 + 源头堵泄漏（commit `fa98a0d`）。烤机期重新起算；新增触控板回归清单；记录双实例风险与 master 预存 Left 键优先级 bug |
 
 ## 控制实验 — v1.3 键盘路径 vs 触控板 hook 路径
 
@@ -883,6 +884,8 @@ if (EnableTouchpadAppSwitch && (windowRect.left < 0 || windowRect.top < 0))
 | 开关 OFF = 回到旧行为 | 开关只能门控"挂载点"，门控不了**写进共用方法里的代码**——每一处对共用路径的修改都要单独问一句：开关 OFF 时它还在吗？ |
 | 异常崩不动就先怀疑平台 | 先自查经典陷阱（**P/Invoke 回调委托持有**、句柄/句柄生命周期、GC 时序）——"平台 bug"应该是最后才配下的结论 |
 | 反复叠加防御层碰运气 | 用**分阶段开关二分定位**，一次只放行一层，让证据指认元凶（Stage 1-5 一轮就锁定了根因）|
+| 防御/消重逻辑天然安全 | **防御性代码同样需要隔离与回归验证**——消重误杀事件证明：一行无门控的防御就能让功能永久失效，且症状（"忽然不工作了"）与真凶（两个粘性标志的组合）之间毫无表面关联 |
+| 布尔标志便宜好用 | **粘性标志是状态机异味**：置位点与清除点不成对的标志（`IsManualMousePositioningTriggered` 被手势路径置位、只能被 Ctrl 清除）迟早组成死锁。新加标志先问：谁置、谁清、什么路径会读到它 |
 
 ## v3.0 翻案 — 根因与分阶段二分定位
 
@@ -931,12 +934,53 @@ SetWinEventHook(..., ForegroundEventCallback, ...);
 3. **双重触发劫持**：开关 ON 时 Alt+Tab 必然同时触发前台事件，事件回调把进行中序列的 trigger 改写为 ForegroundHook（Stage 3 时因此误压了键盘移动）。已加消重：键盘路径重定位进行中时，前台事件直接跳过，Alt+Tab 回归 100% 键盘路径。
 4. **手势事件线程指纹**：手势产生的前台事件全部来自同一个 shell 线程；键盘 Alt+Tab 的事件来自各目标应用自己的线程。
 
-## 现状与建议（v3.0 更新）
+## 消重误杀事件（v3.1）— 手势在 Win+Shift+方向键后永久失效
+
+> 时间：2026-09-24 下午；修复 commit：`fa98a0d`。**这是消重逻辑（`0d98967` 引入）自身的回归**——防御性代码也会咬人。
+
+### 现象
+
+`Win+Shift+方向键` 移动窗口到另一屏后，三指手势**永久失效**（应用照常切换，鼠标不跟随）；Alt+Tab 完全正常；按一次 Ctrl 后手势自动复活。
+
+### 证据（日志现场）
+
+```
+15:26:18  手势 → TriggerManualMousePositioning(ForegroundHook)  ← ① 污染发生
+15:26:19  Win+Shift+← → ActiveTrigger=Keyboard；移动完成        ← ② 组合武装
+15:26:21  手势 → ForegroundEvent: skipped (keyboard-path repositioning in flight)
+15:26:24/27/30  手势 ×8 → 全部 skipped                         ← ③ 永久锁定
+```
+
+### 根因：两个粘性标志的组合死锁
+
+消重条件为 `ActiveTrigger == Keyboard && (timer.Enabled || IsMousePositioningTriggered || IsManualMousePositioningTriggered)`：
+
+1. `IsManualMousePositioningTriggered` 本是键盘双击 Ctrl 专用标志，但 `TriggerManualMousePositioning` **无条件置位**它，而触控板回调也走此方法 → 一次手势就污染该标志；清除它的只有 Ctrl 键路径 → 不按 Ctrl 永远粘着
+2. `ActiveTrigger` 是"最后触发者"粘性标记，Win+方向键后停在 Keyboard
+
+①②叠加 → 消重条件恒真 → 手势事件被全部跳过。Alt+Tab 不查消重条件故免疫。Ctrl 键清掉①故复活。
+
+### 修复（`fa98a0d`）
+
+- 消重条件剔除 `IsManualMousePositioningTriggered`：Alt+Tab/Win+方向键的 keydown→keyup 窗口由 `IsMousePositioningTriggered`（仅键盘路径置/清）罩住，keyup 后重试窗口由 `timer.Enabled` 罩住——被剔除的标志在这两个场景本就冗余
+- `TriggerManualMousePositioning` 仅键盘路径置位该标志（堵泄漏源头；顺带消除"手势后单点 Ctrl 误触发重定位"的潜伏副作用）
+
+### 验证
+
+Win+Shift+方向键后连续手势正常跨屏跟随（零 skipped）；Alt+Tab 序列期重复事件**正确**消重（skipped 精确聚集在 Alt+Tab 的 ±2s 内）；Alt+Tab 后手势正常。
+
+### 附带发现（记录，未修）
+
+- **应用无单实例防护**：测试期间曾双实例同时运行（双份键盘 hook + 双份前台 hook + 同一日志文件）。master 上同样存在。建议后续加 Mutex 单实例。
+- **master 预存运算符优先级 bug**：`KeyDownHook` 里 `e.Key == Keys.Left || e.Key == Keys.Right && e.isWinPressed` 等价于"裸按 Left 也触发"。
+
+## 现状与建议（v3.1 更新）
 
 | 项 | 决定 |
 |----|------|
 | 崩溃根因 | **已修复**（委托持有，`126685c`）|
-| `EnableTouchpadAppSwitch` 默认值 | 仍为 OFF——按本文档"平台风险特性开发流程"，进入 **7 天日常使用烤机期**；全绿后可翻转为 ON |
+| 消重误杀 | **已修复**（`fa98a0d`）；**7 天烤机期从该构建重新起算**（此前烤机构建含此 bug）|
+| `EnableTouchpadAppSwitch` 默认值 | 仍为 OFF——烤机全绿后翻转 ON |
 | `TouchpadExperimentStage` | 调试仪器保留；注册表缺失 = Stage 5 全功能 |
 | 键盘路径 | 稳定运行；开关 ON 时经消重保持 100% 键盘路径（master 行为）|
 | 触控板 hook 路径 | **复活**：手势跨屏跟随可用 |
@@ -974,6 +1018,13 @@ git diff master -- MousePointerReposition/MainWindowVM.cs
 3. Win+←/→ 跨屏，居中
 4. 双击 Ctrl，居中
 5. 连续 5 分钟混合操作，无崩溃
+
+**触控板回归清单（开关 ON，每次合并前必跑）：**
+
+1. 三指滑动切换应用，鼠标跟随（含跨屏负坐标）
+2. **手势 → Win+Shift+方向键 → 立即连续手势**：手势不得失效（v3.1 消重误杀场景）
+3. Alt+Tab → 鼠标走键盘路径移动；**紧接手势**：手势不得失效
+4. 手势后按一下 Ctrl：不得误触发重定位（`fa98a0d` 顺带修复的泄漏副作用）
 
 ### 第三层：流程纪律（隔离优先，合并靠后）
 
