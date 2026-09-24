@@ -75,13 +75,6 @@ namespace MousePointerReposition
         // keyboard path never crashed (FMUtils roots its hook delegate properly).
         private Vanara.PInvoke.User32.WinEventProc ForegroundEventProcDelegate; // field: keeps the delegate alive against GC
 
-        // Diagnostic low-level keyboard hook (log-only). Reads KBDLLHOOKSTRUCT.flags
-        // so we can tell physical keystrokes from synthetic/injected ones (e.g. if the
-        // touchpad gesture stack injects Alt+Tab). Never interferes: it only logs and
-        // immediately calls CallNextHookEx. Registered only while the experiment is ON.
-        private Vanara.PInvoke.User32.SafeHHOOK DiagnosticKeyboardHook;
-        private Vanara.PInvoke.User32.HookProc DiagnosticKeyboardProcDelegate; // field: keeps the delegate alive against GC
-
         #endregion experiment state
 
         #region settings property
@@ -122,7 +115,9 @@ namespace MousePointerReposition
         private void RegisterForegroundEventHooks()
         {
             var stage = SettingsHelper.Instance.TouchpadExperimentStage;
-            if (stage < 1 || stage > 5) stage = 1; // 0/unset → ObserveOnly (safest)
+            // 0/unset → Full: the feature works when the user turns the toggle ON.
+            // Stages 1-4 remain as debugging instruments (opt-in via registry).
+            if (stage < 1 || stage > 5) stage = 5;
             ExperimentStage = stage;
             App.logger.Information($"Foreground event hook init: EnableTouchpadAppSwitch={EnableTouchpadAppSwitch}, ExperimentStage={ExperimentStage}");
             ForegroundEventHooks = new System.Collections.Generic.List<Vanara.PInvoke.User32.HWINEVENTHOOK>();
@@ -131,6 +126,9 @@ namespace MousePointerReposition
                 // root the callback delegate BEFORE registering (see field comment)
                 ForegroundEventProcDelegate = ForegroundEventCallback;
 
+                // EVENT_SYSTEM_FOREGROUND only. The SWITCHSTART..END range was dropped:
+                // Win11 never emits those events (zero occurrences across all captured
+                // logs) and gestures reliably fire FOREGROUND anyway.
                 var hookFront = Vanara.PInvoke.User32.SetWinEventHook(
                     Vanara.PInvoke.User32.EventConstants.EVENT_SYSTEM_FOREGROUND,
                     Vanara.PInvoke.User32.EventConstants.EVENT_SYSTEM_FOREGROUND,
@@ -144,23 +142,7 @@ namespace MousePointerReposition
                 else
                     ForegroundEventHooks.Add(hookFront);
 
-                var hookSwitch = Vanara.PInvoke.User32.SetWinEventHook(
-                    Vanara.PInvoke.User32.EventConstants.EVENT_SYSTEM_SWITCHSTART,
-                    Vanara.PInvoke.User32.EventConstants.EVENT_SYSTEM_SWITCHEND,
-                    Vanara.PInvoke.HINSTANCE.NULL,
-                    ForegroundEventProcDelegate,
-                    0,
-                    0,
-                    Vanara.PInvoke.User32.WINEVENT.WINEVENT_OUTOFCONTEXT);
-                if (hookSwitch.IsNull)
-                    App.logger.Warning("Failed to register EVENT_SYSTEM_SWITCHSTART..END hook");
-                else
-                    ForegroundEventHooks.Add(hookSwitch);
-
-                App.logger.Debug($"Foreground event hooks registered: {ForegroundEventHooks.Count}/2");
-
-                // diagnostic keyboard hook (log-only, observes the INJECTED flag)
-                RegisterDiagnosticKeyboardHook();
+                App.logger.Debug($"Foreground event hooks registered: {ForegroundEventHooks.Count}/1");
             }
             else
             {
@@ -186,13 +168,6 @@ namespace MousePointerReposition
                 }
                 ForegroundEventHooks.Clear();
             }
-
-            if (DiagnosticKeyboardHook != null && !DiagnosticKeyboardHook.IsNull)
-            {
-                App.logger.Debug("UnhookWindowsHookEx (diagnostic keyboard hook)");
-                Vanara.PInvoke.User32.UnhookWindowsHookEx(DiagnosticKeyboardHook); // SafeHHOOK → HHOOK implicit
-                DiagnosticKeyboardHook = null;
-            }
         }
 
         #endregion hook lifecycle
@@ -217,13 +192,9 @@ namespace MousePointerReposition
         {
             App.logger.Debug($"ForegroundEventCallback: eventId=0x{eventId:X4} hwnd=0x{(hwnd.IsNull ? 0L : ((IntPtr)hwnd).ToInt64()):X}");
 
-            // SWITCHSTART just signals that a switcher UI appeared — do not trigger repositioning yet.
-            // FOREGROUND and SWITCHEND both indicate the user has finished the gesture and the new
-            // target app may now be foreground (or about to be).
-            if (eventId == Vanara.PInvoke.User32.EventConstants.EVENT_SYSTEM_SWITCHSTART)
-            {
-                return;
-            }
+            // Note: EVENT_SYSTEM_SWITCHSTART/SWITCHEND are never emitted by Win11 (zero
+            // occurrences across all captured logs) and we no longer hook that range;
+            // every event arriving here is EVENT_SYSTEM_FOREGROUND.
 
             // filter self window (only meaningful when hwnd is valid)
             if (!hwnd.IsNull)
@@ -271,6 +242,19 @@ namespace MousePointerReposition
                         App.logger.Debug("ForegroundEvent: skipped (disabled after marshal)");
                         return;
                     }
+
+                    // Double-trigger dedupe: a foreground change caused by a keyboard shortcut
+                    // we already handle (Alt+Tab / Win+arrows / 2x Ctrl) arrives here only ~ms
+                    // after the keyboard path started its own repositioning sequence. Let the
+                    // keyboard path finish with master-exact behavior instead of hijacking the
+                    // sequence (observed at Stage 3/4: the event rewrote ActiveTrigger
+                    // mid-flight and the move was misclassified as foreground-hook-triggered).
+                    if (ActiveTrigger == RepositionTrigger.Keyboard
+                        && (RepositioningTimer.Enabled || IsMousePositioningTriggered || IsManualMousePositioningTriggered))
+                    {
+                        App.logger.Debug("ForegroundEvent: skipped (keyboard-path repositioning in flight)");
+                        return;
+                    }
                     // Stage 2 (MarshalOnly): prove the dispatcher round-trip survives,
                     // but do not touch the repositioning pipeline.
                     if (ExperimentStage <= 2)
@@ -296,44 +280,11 @@ namespace MousePointerReposition
 
         #endregion hook callback
 
-        #region diagnostic keyboard hook (log-only instrumentation)
-
-        /// <summary>
-        /// Registers a log-only WH_KEYBOARD_LL hook that reports the LLKHF_INJECTED
-        /// flag for every key event. This distinguishes physical keystrokes from
-        /// synthetic ones injected by the shell (e.g. if the precision-touchpad
-        /// gesture stack implements 'switch apps' by injecting Alt+Tab).
-        /// Only registered while the experiment switch is ON.
-        /// </summary>
-        private void RegisterDiagnosticKeyboardHook()
-        {
-            DiagnosticKeyboardProcDelegate = DiagnosticKeyboardProc;
-            DiagnosticKeyboardHook = Vanara.PInvoke.User32.SetWindowsHookEx(
-                Vanara.PInvoke.User32.HookType.WH_KEYBOARD_LL,
-                DiagnosticKeyboardProcDelegate,
-                Vanara.PInvoke.HINSTANCE.NULL,
-                0);
-            if (DiagnosticKeyboardHook.IsNull)
-                App.logger.Warning("[DiagKey] diagnostic keyboard hook failed to register");
-            else
-                App.logger.Information("[DiagKey] diagnostic keyboard hook registered (log-only)");
-        }
-
-        private IntPtr DiagnosticKeyboardProc(int nCode, IntPtr wParam, IntPtr lParam)
-        {
-            if (nCode >= 0)
-            {
-                var kb = System.Runtime.InteropServices.Marshal.PtrToStructure<Vanara.PInvoke.User32.KBDLLHOOKSTRUCT>(lParam);
-                var flags = kb.flags; // uint: bit0 = LLKHF_INJECTED, bit1 = LLKHF_LOWER_IL_INJECTED
-                bool injected = (flags & 0x1) != 0;          // LLKHF_INJECTED
-                bool lowerIlInjected = (flags & 0x2) != 0;   // LLKHF_LOWER_IL_INJECTED
-                App.logger.Information($"[DiagKey] vk=0x{kb.vkCode:X2} scan=0x{kb.scanCode:X2} msg=0x{wParam.ToInt64():X4} injected={injected} lowerIL={lowerIlInjected}");
-            }
-            // hhk of CallNextHookEx is ignored by the system; pass a null handle.
-            return Vanara.PInvoke.User32.CallNextHookEx(new Vanara.PInvoke.User32.HHOOK(IntPtr.Zero), nCode, wParam, lParam);
-        }
-
-        #endregion diagnostic keyboard hook (log-only instrumentation)
+        // Note: a log-only diagnostic WH_KEYBOARD_LL hook used to live here. It answered
+        // its question (touchpad gestures do NOT inject synthetic keystrokes — zero
+        // keyboard events during gesture tests, LLKHF_INJECTED always false) and was
+        // removed: a per-keystroke Information-level logger should not ship.
+        // See git history (commit 126685c) if it is ever needed again.
 
         #region experiment guard (single permitted touchpoint in the shared pipeline)
 

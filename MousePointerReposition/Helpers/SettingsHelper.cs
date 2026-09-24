@@ -72,7 +72,7 @@ namespace MousePointerReposition.Helper
         /// <summary>
         /// Touchpad experiment stage — internal debugging switch (registry only, no UI).
         /// Only consulted when EnableTouchpadAppSwitch is ON. Bisects the crashing path:
-        ///   0/unset = treated as 1 (ObserveOnly)
+        ///   0/unset = treated as 5 (Full) — stages 1-4 are debugging instruments
         ///   1 = ObserveOnly  — foreground callback only logs event details, NO dispatcher marshal
         ///   2 = MarshalOnly  — + Dispatcher.BeginInvoke round-trip, lambda logs and returns
         ///   3 = NoCursorMove — + full trigger/timer/geometry pipeline, SetCursorPos suppressed
