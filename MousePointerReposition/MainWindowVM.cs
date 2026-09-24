@@ -529,7 +529,11 @@ namespace MousePointerReposition
             App.logger.Debug("TriggerManualMousePositioning start");
             ActiveTrigger = trigger; // keyboard (2x Ctrl) by default; the touchpad callback passes ForegroundHook
             RepositioningTimer.Stop(); // stop currently executing repositioning
-            IsManualMousePositioningTriggered = true;
+            // Only keyboard-origin manual triggers (2x Ctrl) may arm this keyboard flag;
+            // the foreground path must not leak into it (leak caused a permanent dedupe
+            // lockout, and made a later lone Ctrl release misread as "2x Ctrl pending").
+            // Switch OFF => trigger is always Keyboard => behavior identical to master.
+            IsManualMousePositioningTriggered = (trigger == RepositionTrigger.Keyboard);
 
             // save empty current foreground window rectangle
             foreGroundWindowRectStart = new Vanara.PInvoke.RECT();

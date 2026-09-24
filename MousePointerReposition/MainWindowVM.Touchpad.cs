@@ -244,13 +244,20 @@ namespace MousePointerReposition
                     }
 
                     // Double-trigger dedupe: a foreground change caused by a keyboard shortcut
-                    // we already handle (Alt+Tab / Win+arrows / 2x Ctrl) arrives here only ~ms
-                    // after the keyboard path started its own repositioning sequence. Let the
-                    // keyboard path finish with master-exact behavior instead of hijacking the
-                    // sequence (observed at Stage 3/4: the event rewrote ActiveTrigger
-                    // mid-flight and the move was misclassified as foreground-hook-triggered).
+                    // we already handle (Alt+Tab / Win+arrows) arrives here only ~ms after the
+                    // keyboard path started its own repositioning sequence. Let the keyboard
+                    // path finish with master-exact behavior instead of hijacking the sequence.
+                    // NOTE: deliberately does NOT consult IsManualMousePositioningTriggered —
+                    // that flag's lifecycle is keyboard-Ctrl-only and previously leaked when
+                    // the foreground path set it, causing a permanent dedupe lockout
+                    // (gesture → flag stuck true → Win+arrow → trigger=Keyboard → all later
+                    // gestures skipped forever). IsMousePositioningTriggered has a reliable
+                    // keyboard-only lifecycle (set in TriggerMousePositioning, cleared in
+                    // ExecuteMousePositioning) and covers the keydown→keyup window; the timer
+                    // check covers the post-keyup retry window. 2xCtrl never changes the
+                    // foreground window, so it needs no dedupe coverage.
                     if (ActiveTrigger == RepositionTrigger.Keyboard
-                        && (RepositioningTimer.Enabled || IsMousePositioningTriggered || IsManualMousePositioningTriggered))
+                        && (RepositioningTimer.Enabled || IsMousePositioningTriggered))
                     {
                         App.logger.Debug("ForegroundEvent: skipped (keyboard-path repositioning in flight)");
                         return;
