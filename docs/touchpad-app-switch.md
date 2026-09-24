@@ -780,8 +780,11 @@ TC-E-4  ☐ 通过 ☐ 失败  备注: ___________
 | **v2.0** | **控制实验结论** | **设计预期被实证推翻**。详见下面"控制实验"章节。 |
 | v2.1 | 守卫门控修复 | 发现 v1.12 负坐标守卫放在共用方法 `TryMouseRepositioning` 里，开关 OFF 时仍侵入 Alt+Tab 路径（跨屏失灵）；改为仅在 `EnableTouchpadAppSwitch=true` 时生效（commit `e964f03`）。详见"共用路径污染事件"章节 |
 | v2.2 | 物理隔离重构 | 触控板实验代码抽为 partial class `MainWindowVM.Touchpad.cs`；守卫从"开关门控"改为**路径（trigger）门控**——开关 ON 时键盘路径也不再被守卫拦截；新增"实验特性开发约束"与"平台风险特性开发流程"两个治理章节 |
+| **v3.0** | **根因翻案** | 崩溃根因 = **未持有的 WinEventProc 委托**（GC 回收 → 下一事件跳入已释放 thunk → 0xC000041D），两行修复（commit `126685c`）。Stage 1-5 分阶段二分实证（见"v3.0 翻案"章节）。v2.0 的"平台不可行"归因**作废**：SetCursorPos / 负坐标 / WPF Dispatcher 全部清白。清理：拆诊断键盘钩子与从不触发的 SWITCH hook、双重触发消重、档位默认全功能（commit `0d98967`）|
 
 ## 控制实验 — v1.3 键盘路径 vs 触控板 hook 路径
+
+> ⚠️ **v3.0 更新**：本实验的 A/B 现象观察是正确的（hook 路径崩、键盘路径稳），但**归因错误**——崩溃不是"Win11/WPF 平台内部不可达 bug"，而是我们传给 `SetWinEventHook` 的回调委托**未被持有、被 GC 回收**所致。已修复并实证。详见"v3.0 翻案"章节。
 
 **假设**：两条路径（键盘 `Alt+Tab` 和触控板三指）都走同一个 `TryMouseRepositioning`，逻辑上应该一样稳。
 
@@ -878,17 +881,66 @@ if (EnableTouchpadAppSwitch && (windowRect.left < 0 || windowRect.top < 0))
 | 终点相同 = 行为相同 | 到达终点的**路线**决定稳定性 |
 | 防御放在共用层最安全 | 防御必须**只罩住它要保护的那条路** |
 | 开关 OFF = 回到旧行为 | 开关只能门控"挂载点"，门控不了**写进共用方法里的代码**——每一处对共用路径的修改都要单独问一句：开关 OFF 时它还在吗？ |
+| 异常崩不动就先怀疑平台 | 先自查经典陷阱（**P/Invoke 回调委托持有**、句柄/句柄生命周期、GC 时序）——"平台 bug"应该是最后才配下的结论 |
+| 反复叠加防御层碰运气 | 用**分阶段开关二分定位**，一次只放行一层，让证据指认元凶（Stage 1-5 一轮就锁定了根因）|
 
-## 现状与建议
+## v3.0 翻案 — 根因与分阶段二分定位
+
+**v2.0 的归因是错的。** 控制实验的 A/B 现象观察没问题（hook 路径确实崩、键盘路径确实稳），但把根因归给"Win11/WPF 平台内部不可达的 native bug"是错的。**真凶是我们自己代码里的一个经典 P/Invoke 陷阱。**
+
+### 根因：未持有的 WinEventProc 委托
+
+```csharp
+// 原代码（f2f31ce 起就存在）：
+SetWinEventHook(..., ForegroundEventCallback, ...);
+//                  >>> 方法组 → 临时委托实例，没有任何字段持有它 <<<
+```
+
+传给 native 的回调委托必须保持引用。GC 在某个时刻回收这个无根委托 → 下一次 WinEvent 到达时，native 代码跳进**已释放的 thunk** → AccessViolation → `0xC000041D`（STATUS_FATAL_USER_CALLBACK_EXCEPTION）。
+
+**修复**：实例字段持有委托，注册前赋值。两行。
+
+### 为什么这个根因能解释 v1.3–v2.0 的全部观测
+
+| 观测 | 解释 |
+|------|------|
+| 崩溃延迟 9~14 秒且不固定 | 需要先等 GC 回收委托，再等下一个事件触发；GC 时机不确定 |
+| 键盘路径从不崩 | FMUtils 库正确持有它的 hook 委托 |
+| try-catch 全包无效 | 异常不在我们的托管代码里，在 CLR 的已释放委托桩里 |
+| `DispatcherUnhandledException.e.Handled=true` 无效 | 同上，根本走不到 dispatcher 异常通道 |
+| 负坐标守卫无效 | 跳过 SetCursorPos 照样崩（v2.0 已记录）——崩溃与 SetCursorPos 无关 |
+| 只在开关 ON 时崩 | 只有这条路径注册了未持有委托的 hook |
+| 崩溃栈在 `Dispatcher.PushFrame → GetMessageW` | WinEvent 回调由消息泵分发；死的正是消息泵里那个调用帧 |
+
+### 分阶段二分定位法（Stage 1-5）
+
+引入 `TouchpadExperimentStage` 内部开关（注册表，无 UI），把可疑链路切成五段逐段放行，让证据指认元凶：
+
+| Stage | 放行范围 | 结果 |
+|-------|---------|------|
+| 1 ObserveOnly | 回调只记日志，不碰 Dispatcher | 修复前：**照样崩**（二分一步见底）；修复后：21 分钟零崩 |
+| 2 MarshalOnly | + Dispatcher.BeginInvoke 往返 | 稳定（v2.0 怀疑的 PushFrame 层清白）|
+| 3 NoCursorMove | + 完整管线，抑制 SetCursorPos | 稳定 |
+| 4 Full+守卫 | 全功能，负坐标守卫生效 | 稳定；但守卫拦掉合法移动（左/上副屏）——**守卫的存在理由已随根因修复消失** |
+| 5 Full 无守卫 | 完整行为 | **手势/键盘跨屏全部正常，负坐标 SetCursorPos 反复执行零崩** |
+
+### 附带实证结论
+
+1. **手势不注入合成击键**：诊断键盘钩子（`LLKHF_INJECTED`）全程观测——手势时段零键盘事件；物理 Alt+Tab 有真实扫描码且 `injected=False`。手势由 shell 直接驱动切换器，**完全绕过键盘栈**。（诊断钩子使命完成后已拆除，见 git 历史）
+2. **Win11 从不发 `EVENT_SYSTEM_SWITCHSTART/END`**：全部日志零出现。v1.1 扩展的 hook 范围是死代码，已拆（注册 1/1）。
+3. **双重触发劫持**：开关 ON 时 Alt+Tab 必然同时触发前台事件，事件回调把进行中序列的 trigger 改写为 ForegroundHook（Stage 3 时因此误压了键盘移动）。已加消重：键盘路径重定位进行中时，前台事件直接跳过，Alt+Tab 回归 100% 键盘路径。
+4. **手势事件线程指纹**：手势产生的前台事件全部来自同一个 shell 线程；键盘 Alt+Tab 的事件来自各目标应用自己的线程。
+
+## 现状与建议（v3.0 更新）
 
 | 项 | 决定 |
 |----|------|
-| `EnableTouchpadAppSwitch` 默认值 | **OFF** |
-| 键盘路径（`Alt+Tab` / `Win+←/→` / 双击 Ctrl）| **保留并稳定运行** |
-| 触控板 hook 代码 | **保留为受控实验路径**，默认不挂载 |
-| README / 用户文档 | 标注 "触控板三指切换在当前 Win11 + WPF 环境下与平台冲突，暂不可用；键盘三组合稳定" |
-
-**待 Win11 / .NET 后续版本修复 `Dispatcher.PushFrame` 在多显示器下的 native AV（如果确认是 Microsoft bug），可能重新启用。**
+| 崩溃根因 | **已修复**（委托持有，`126685c`）|
+| `EnableTouchpadAppSwitch` 默认值 | 仍为 OFF——按本文档"平台风险特性开发流程"，进入 **7 天日常使用烤机期**；全绿后可翻转为 ON |
+| `TouchpadExperimentStage` | 调试仪器保留；注册表缺失 = Stage 5 全功能 |
+| 键盘路径 | 稳定运行；开关 ON 时经消重保持 100% 键盘路径（master 行为）|
+| 触控板 hook 路径 | **复活**：手势跨屏跟随可用 |
+| 烤机期通过后 | 翻转 `EnableTouchpadAppSwitch` 默认 ON；评估 Stage 开关去留 |
 
 ## 实验特性开发约束（防止再次污染稳定路径）
 
