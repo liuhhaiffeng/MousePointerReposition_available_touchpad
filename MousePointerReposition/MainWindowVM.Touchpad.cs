@@ -89,6 +89,7 @@ namespace MousePointerReposition
         private Vanara.PInvoke.User32.SafeHHOOK MouseButtonHook;
         private Vanara.PInvoke.User32.HookProc MouseButtonHookProcDelegate; // field: keep alive against GC (same unrooted-delegate lesson as WinEventProc)
         private System.DateTime LastMouseButtonDownUtc; // UI thread only (LL hook callbacks are delivered on the installing thread's message loop)
+        private int LastMouseButtonMsg; // WM_*BUTTONDOWN identity of the last press — recorded (not logged) so suppression decisions can report their evidence
 
         // Keyboard-activity suppression (UX): foreground changes caused by keyboard
         // actions we do NOT handle as triggers (Win key opening Start, Win+E
@@ -103,6 +104,14 @@ namespace MousePointerReposition
         private Vanara.PInvoke.User32.SafeHHOOK KeyboardActivityHook;
         private Vanara.PInvoke.User32.HookProc KeyboardActivityHookProcDelegate; // field: keep alive against GC
         private System.DateTime LastKeyboardActivityUtc; // UI thread only
+        private uint LastKeyboardVk; // vkCode of the last key event — same decision-evidence purpose
+
+        /// <summary>Formats a UTC timestamp as an age string for decision-point diagnostics.</summary>
+        private static string FormatAgeUtc(System.DateTime utc)
+        {
+            if (utc == default(System.DateTime)) return "never";
+            return ((int)(System.DateTime.UtcNow - utc).TotalMilliseconds) + "ms";
+        }
 
         #endregion experiment state
 
@@ -256,7 +265,10 @@ namespace MousePointerReposition
             {
                 int msg = unchecked((int)wParam.ToInt64());
                 if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN)
+                {
                     LastMouseButtonDownUtc = System.DateTime.UtcNow;
+                    LastMouseButtonMsg = msg;
+                }
             }
             // hhk of CallNextHookEx is ignored by the system; pass a null handle.
             return Vanara.PInvoke.User32.CallNextHookEx(new Vanara.PInvoke.User32.HHOOK(IntPtr.Zero), nCode, wParam, lParam);
@@ -270,7 +282,11 @@ namespace MousePointerReposition
         private IntPtr KeyboardActivityHookProc(int nCode, IntPtr wParam, IntPtr lParam)
         {
             if (nCode >= 0)
+            {
+                var kb = System.Runtime.InteropServices.Marshal.PtrToStructure<Vanara.PInvoke.User32.KBDLLHOOKSTRUCT>(lParam);
+                LastKeyboardVk = kb.vkCode;
                 LastKeyboardActivityUtc = System.DateTime.UtcNow; // keydown and keyup both count for recency
+            }
             return Vanara.PInvoke.User32.CallNextHookEx(new Vanara.PInvoke.User32.HHOOK(IntPtr.Zero), nCode, wParam, lParam);
         }
 
@@ -373,7 +389,7 @@ namespace MousePointerReposition
                     if (MouseButtonHook != null && !MouseButtonHook.IsNull
                         && (System.DateTime.UtcNow - LastMouseButtonDownUtc).TotalMilliseconds < MouseClickSuppressMs)
                     {
-                        App.logger.Debug("ForegroundEvent: skipped (recent mouse click)");
+                        App.logger.Debug($"ForegroundEvent: skipped (recent mouse click: msg=0x{LastMouseButtonMsg:X4} {FormatAgeUtc(LastMouseButtonDownUtc)} ago < {MouseClickSuppressMs}ms)");
                         return;
                     }
 
@@ -385,7 +401,7 @@ namespace MousePointerReposition
                     if (KeyboardActivityHook != null && !KeyboardActivityHook.IsNull
                         && (System.DateTime.UtcNow - LastKeyboardActivityUtc).TotalMilliseconds < KeyboardSuppressMs)
                     {
-                        App.logger.Debug("ForegroundEvent: skipped (recent keyboard input)");
+                        App.logger.Debug($"ForegroundEvent: skipped (recent keyboard input: vk=0x{LastKeyboardVk:X2} {FormatAgeUtc(LastKeyboardActivityUtc)} ago < {KeyboardSuppressMs}ms)");
                         return;
                     }
                     // Stage 2 (MarshalOnly): prove the dispatcher round-trip survives,
@@ -396,7 +412,10 @@ namespace MousePointerReposition
                         return;
                     }
 
-                    App.logger.Debug($"ForegroundEvent: triggering mouse positioning (eventId=0x{eventId:X4})");
+                    // Passing all gates means: no in-flight keyboard sequence, no recent
+                    // click, no recent key — i.e. a gesture-caused switch. Log the
+                    // (negative) input evidence so every trigger decision is auditable.
+                    App.logger.Debug($"ForegroundEvent: triggering mouse positioning (eventId=0x{eventId:X4}, lastKey={FormatAgeUtc(LastKeyboardActivityUtc)}, lastClick={FormatAgeUtc(LastMouseButtonDownUtc)})");
 
                     // Use the MANUAL trigger path (empty "old" rectangle) because by the time
                     // the Win32 event fires, the foreground window has ALREADY changed. Capturing
