@@ -785,6 +785,7 @@ TC-E-4  ☐ 通过 ☐ 失败  备注: ___________
 | v3.2 | 已知限制 + 治理 | UIPI 提权应用盲区实证（A/B/C 三步实验）并决策接受现状；新增 `docs/TODO.md` 存放提权运行 / uiAccess 两条后续研究路线；单实例 Mutex（`f16c351`）与 Left 键优先级修复（`8c979c1`）入库 |
 | v3.3 | UX 优化 | 点击抑制：窗口关闭/最小化按钮、任务栏图标等**点击引起**的前台切换不再移动光标（`WH_MOUSE_LL` 时间戳 + 500ms 窗口，commit `bb5033a`）；备选方案 B（消失检测）留档未实施 |
 | v3.4 | UX 优化 | 键盘近因抑制：Win 键/Win+E 等**键盘动作引起**的前台切换不再移动光标（被动 `WH_KEYBOARD_LL` 时间戳 + 1000ms 窗口，commit `2a71801`）；前台路径语义收拢为"仅响应手势"，新增触发判定全景表 |
+| v3.5 | 可观测性 | 决策点证据日志：skip/trigger 行携带输入身份+距今时间+阈值（commit `e784a36`）；新增"人工验证 → 日志对照表"，人工验证结果机械可核对 |
 
 ## 控制实验 — v1.3 键盘路径 vs 触控板 hook 路径
 
@@ -1075,6 +1076,26 @@ Win+Shift+方向键后连续手势正常跨屏跟随（零 skipped）；Alt+Tab 
 | Win 键 / Win+E / 其他键盘动作 | 跳过 | 键盘近因（1s） |
 | 点击关闭/最小化/任务栏/其他窗口 | 跳过 | 点击抑制（0.5s） |
 | 无输入的自发前台变更 | 移动 | 无法区分，接受 |
+
+## 可观测性：决策点证据日志（v3.5）
+
+> 2026-09-28 实施（commit `e784a36`）。来源：用户要求"我的验证结果应该能从日志中看出来"。
+
+**原则：不记录输入流，只记录决策依据。** 逐键日志已证不可交付（已拆除过）；而前台事件的 skip/trigger 决策点很稀有，在决策点上携带证据零噪音。
+
+实现：两个被动钩子除时间戳外只**记录**（不打日志）最近输入身份（`vkCode` / 按钮消息）；决策点日志携带身份 + 距今时间 + 阈值。
+
+### 人工验证 → 日志对照表（机械可核对）
+
+| 用户动作 | 日志签名 |
+|---------|---------|
+| 按 Win 键 | `skipped (recent keyboard input: vk=0x5B XXms ago < 1000ms)` |
+| Win+E | `skipped (recent keyboard input: vk=0x45 ...)`（E 的 vk=0x45） |
+| 点关闭/最小化按钮 | `skipped (recent mouse click: msg=0x0201 XXms ago < 500ms)`（左键=0x0201） |
+| 点任务栏图标 | 同上 |
+| Alt+Tab | `Alt+Tab` + `skipped (keyboard-path repositioning in flight)` |
+| 三指手势 | `triggering mouse positioning (..., lastKey=XXms, lastClick=XXms)` —— **lastKey/lastClick 均大于阈值（或 never）即证明放行正确** |
+| 手势被误杀（bug 上报时） | skip 行的时间差直接区分：真刚输入过（正确拦截）vs 时间戳异常（bug） |
 
 ## 现状与建议（v3.1 更新）
 
