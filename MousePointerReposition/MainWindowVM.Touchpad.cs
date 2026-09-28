@@ -90,6 +90,20 @@ namespace MousePointerReposition
         private Vanara.PInvoke.User32.HookProc MouseButtonHookProcDelegate; // field: keep alive against GC (same unrooted-delegate lesson as WinEventProc)
         private System.DateTime LastMouseButtonDownUtc; // UI thread only (LL hook callbacks are delivered on the installing thread's message loop)
 
+        // Keyboard-activity suppression (UX): foreground changes caused by keyboard
+        // actions we do NOT handle as triggers (Win key opening Start, Win+E
+        // launching Explorer, etc.) must not move the cursor either. Together with
+        // click-suppression, the foreground path reacts only to switches that
+        // produced no recent keyboard AND no recent button input — which,
+        // empirically, means touchpad swipe gestures (they inject neither; see
+        // docs/touchpad-app-switch.md). Passive observer: timestamp only, always
+        // CallNextHookEx, no per-keystroke logging (that lesson shipped and was
+        // removed in 0d98967).
+        private const int KeyboardSuppressMs = 1000; // key -> new-window-foreground latency budget
+        private Vanara.PInvoke.User32.SafeHHOOK KeyboardActivityHook;
+        private Vanara.PInvoke.User32.HookProc KeyboardActivityHookProcDelegate; // field: keep alive against GC
+        private System.DateTime LastKeyboardActivityUtc; // UI thread only
+
         #endregion experiment state
 
         #region settings property
@@ -170,6 +184,18 @@ namespace MousePointerReposition
                     App.logger.Warning("Mouse button hook failed to register; click-caused switches will not be suppressed");
                 else
                     App.logger.Debug("Mouse button hook registered (click-suppression)");
+
+                // passive keyboard-activity observer (keyboard suppression, see field comment)
+                KeyboardActivityHookProcDelegate = KeyboardActivityHookProc;
+                KeyboardActivityHook = Vanara.PInvoke.User32.SetWindowsHookEx(
+                    Vanara.PInvoke.User32.HookType.WH_KEYBOARD_LL,
+                    KeyboardActivityHookProcDelegate,
+                    Vanara.PInvoke.HINSTANCE.NULL,
+                    0);
+                if (KeyboardActivityHook.IsNull)
+                    App.logger.Warning("Keyboard activity hook failed to register; keyboard-caused switches will not be suppressed");
+                else
+                    App.logger.Debug("Keyboard activity hook registered (keyboard-suppression)");
             }
             else
             {
@@ -202,6 +228,13 @@ namespace MousePointerReposition
                 Vanara.PInvoke.User32.UnhookWindowsHookEx(MouseButtonHook); // SafeHHOOK → HHOOK implicit
                 MouseButtonHook = null;
             }
+
+            if (KeyboardActivityHook != null && !KeyboardActivityHook.IsNull)
+            {
+                App.logger.Debug("UnhookWindowsHookEx (keyboard activity hook)");
+                Vanara.PInvoke.User32.UnhookWindowsHookEx(KeyboardActivityHook);
+                KeyboardActivityHook = null;
+            }
         }
 
         #endregion hook lifecycle
@@ -226,6 +259,18 @@ namespace MousePointerReposition
                     LastMouseButtonDownUtc = System.DateTime.UtcNow;
             }
             // hhk of CallNextHookEx is ignored by the system; pass a null handle.
+            return Vanara.PInvoke.User32.CallNextHookEx(new Vanara.PInvoke.User32.HHOOK(IntPtr.Zero), nCode, wParam, lParam);
+        }
+
+        /// <summary>
+        /// Passive WH_KEYBOARD_LL callback: timestamps keyboard activity so the
+        /// foreground callback can tell keyboard-caused switches (Win key,
+        /// Win+E, ...) from gesture-caused ones. Never interferes with input.
+        /// </summary>
+        private IntPtr KeyboardActivityHookProc(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0)
+                LastKeyboardActivityUtc = System.DateTime.UtcNow; // keydown and keyup both count for recency
             return Vanara.PInvoke.User32.CallNextHookEx(new Vanara.PInvoke.User32.HHOOK(IntPtr.Zero), nCode, wParam, lParam);
         }
 
@@ -329,6 +374,18 @@ namespace MousePointerReposition
                         && (System.DateTime.UtcNow - LastMouseButtonDownUtc).TotalMilliseconds < MouseClickSuppressMs)
                     {
                         App.logger.Debug("ForegroundEvent: skipped (recent mouse click)");
+                        return;
+                    }
+
+                    // Keyboard-activity suppression: the foreground change follows recent
+                    // keyboard input we do not handle as a trigger (Win key opening
+                    // Start, Win+E launching Explorer, launching apps by typing, ...).
+                    // Alt+Tab / Win+arrows were already deduped above. Net effect:
+                    // the foreground path only reacts to gesture-caused switches.
+                    if (KeyboardActivityHook != null && !KeyboardActivityHook.IsNull
+                        && (System.DateTime.UtcNow - LastKeyboardActivityUtc).TotalMilliseconds < KeyboardSuppressMs)
+                    {
+                        App.logger.Debug("ForegroundEvent: skipped (recent keyboard input)");
                         return;
                     }
                     // Stage 2 (MarshalOnly): prove the dispatcher round-trip survives,
