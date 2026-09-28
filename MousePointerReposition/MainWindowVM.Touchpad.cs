@@ -82,14 +82,20 @@ namespace MousePointerReposition
         // the cursor would jump to that window's center), taskbar icon clicks,
         // and any other click-driven activation. Touchpad three-finger SWIPES
         // generate no button events, so gesture switches are unaffected.
-        // This hook is a passive observer: it only timestamps button-downs and
-        // always calls CallNextHookEx. Registered/unregistered together with the
+        // The same hook also timestamps WM_MOUSEMOVE for the cursor-in-motion gate:
+        // never yank the cursor while the user is actively moving it (e.g. moving
+        // toward a flashing tray icon while a notification churns the foreground —
+        // that churn produces no keyboard/button input and passes every other gate).
+        // This hook is a passive observer: it only timestamps input and always
+        // calls CallNextHookEx. Registered/unregistered together with the
         // foreground event hooks (same switch gate).
         private const int MouseClickSuppressMs = 500; // click -> foreground-change latency budget
+        private const int MouseMoveSuppressMs = 250;  // cursor-in-motion gate; gesture swipes move no cursor, so the last move predates a swipe by more than this
         private Vanara.PInvoke.User32.SafeHHOOK MouseButtonHook;
         private Vanara.PInvoke.User32.HookProc MouseButtonHookProcDelegate; // field: keep alive against GC (same unrooted-delegate lesson as WinEventProc)
         private System.DateTime LastMouseButtonDownUtc; // UI thread only (LL hook callbacks are delivered on the installing thread's message loop)
         private int LastMouseButtonMsg; // WM_*BUTTONDOWN identity of the last press — recorded (not logged) so suppression decisions can report their evidence
+        private System.DateTime LastMouseMoveUtc; // UI thread only; written per WM_MOUSEMOVE (timestamp write only, no logging)
 
         // Keyboard-activity suppression (UX): foreground changes caused by keyboard
         // actions we do NOT handle as triggers (Win key opening Start, Win+E
@@ -264,7 +270,11 @@ namespace MousePointerReposition
             if (nCode >= 0)
             {
                 int msg = unchecked((int)wParam.ToInt64());
-                if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN)
+                if (msg == 0x0200) // WM_MOUSEMOVE
+                {
+                    LastMouseMoveUtc = System.DateTime.UtcNow;
+                }
+                else if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN)
                 {
                     LastMouseButtonDownUtc = System.DateTime.UtcNow;
                     LastMouseButtonMsg = msg;
@@ -404,6 +414,20 @@ namespace MousePointerReposition
                         App.logger.Debug($"ForegroundEvent: skipped (recent keyboard input: vk=0x{LastKeyboardVk:X2} {FormatAgeUtc(LastKeyboardActivityUtc)} ago < {KeyboardSuppressMs}ms)");
                         return;
                     }
+
+                    // Cursor-in-motion gate: never yank the cursor while the user is
+                    // actively moving it (e.g. moving toward a flashing tray icon while
+                    // a notification churns the foreground — that churn produced no
+                    // keyboard/button input and passed every gate above). Gesture
+                    // swipes move no cursor, so the last real move predates a swipe by
+                    // more than this window. Note: our own SetCursorPos also timestamps
+                    // here, which harmlessly dedupes events trailing a completed jump.
+                    if (MouseButtonHook != null && !MouseButtonHook.IsNull
+                        && (System.DateTime.UtcNow - LastMouseMoveUtc).TotalMilliseconds < MouseMoveSuppressMs)
+                    {
+                        App.logger.Debug($"ForegroundEvent: skipped (cursor in motion: {FormatAgeUtc(LastMouseMoveUtc)} ago < {MouseMoveSuppressMs}ms)");
+                        return;
+                    }
                     // Stage 2 (MarshalOnly): prove the dispatcher round-trip survives,
                     // but do not touch the repositioning pipeline.
                     if (ExperimentStage <= 2)
@@ -413,9 +437,10 @@ namespace MousePointerReposition
                     }
 
                     // Passing all gates means: no in-flight keyboard sequence, no recent
-                    // click, no recent key — i.e. a gesture-caused switch. Log the
-                    // (negative) input evidence so every trigger decision is auditable.
-                    App.logger.Debug($"ForegroundEvent: triggering mouse positioning (eventId=0x{eventId:X4}, lastKey={FormatAgeUtc(LastKeyboardActivityUtc)}, lastClick={FormatAgeUtc(LastMouseButtonDownUtc)})");
+                    // click, no recent key, cursor not in motion — i.e. a gesture-caused
+                    // switch. Log the (negative) input evidence so every trigger decision
+                    // is auditable.
+                    App.logger.Debug($"ForegroundEvent: triggering mouse positioning (eventId=0x{eventId:X4}, lastKey={FormatAgeUtc(LastKeyboardActivityUtc)}, lastClick={FormatAgeUtc(LastMouseButtonDownUtc)}, lastMove={FormatAgeUtc(LastMouseMoveUtc)})");
 
                     // Use the MANUAL trigger path (empty "old" rectangle) because by the time
                     // the Win32 event fires, the foreground window has ALREADY changed. Capturing
