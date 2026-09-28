@@ -75,6 +75,21 @@ namespace MousePointerReposition
         // keyboard path never crashed (FMUtils roots its hook delegate properly).
         private Vanara.PInvoke.User32.WinEventProc ForegroundEventProcDelegate; // field: keeps the delegate alive against GC
 
+        // Click-suppression (UX): a foreground change CAUSED BY a mouse/touchpad
+        // button click must not move the cursor — it is already exactly where the
+        // user put it. Covers: clicking a window's close/minimize button (the
+        // window vanishes, focus falls to the next window, and without this guard
+        // the cursor would jump to that window's center), taskbar icon clicks,
+        // and any other click-driven activation. Touchpad three-finger SWIPES
+        // generate no button events, so gesture switches are unaffected.
+        // This hook is a passive observer: it only timestamps button-downs and
+        // always calls CallNextHookEx. Registered/unregistered together with the
+        // foreground event hooks (same switch gate).
+        private const int MouseClickSuppressMs = 500; // click -> foreground-change latency budget
+        private Vanara.PInvoke.User32.SafeHHOOK MouseButtonHook;
+        private Vanara.PInvoke.User32.HookProc MouseButtonHookProcDelegate; // field: keep alive against GC (same unrooted-delegate lesson as WinEventProc)
+        private System.DateTime LastMouseButtonDownUtc; // UI thread only (LL hook callbacks are delivered on the installing thread's message loop)
+
         #endregion experiment state
 
         #region settings property
@@ -143,6 +158,18 @@ namespace MousePointerReposition
                     ForegroundEventHooks.Add(hookFront);
 
                 App.logger.Debug($"Foreground event hooks registered: {ForegroundEventHooks.Count}/1");
+
+                // passive mouse-button observer (click-suppression, see field comment)
+                MouseButtonHookProcDelegate = MouseButtonHookProc;
+                MouseButtonHook = Vanara.PInvoke.User32.SetWindowsHookEx(
+                    Vanara.PInvoke.User32.HookType.WH_MOUSE_LL,
+                    MouseButtonHookProcDelegate,
+                    Vanara.PInvoke.HINSTANCE.NULL,
+                    0);
+                if (MouseButtonHook.IsNull)
+                    App.logger.Warning("Mouse button hook failed to register; click-caused switches will not be suppressed");
+                else
+                    App.logger.Debug("Mouse button hook registered (click-suppression)");
             }
             else
             {
@@ -168,11 +195,39 @@ namespace MousePointerReposition
                 }
                 ForegroundEventHooks.Clear();
             }
+
+            if (MouseButtonHook != null && !MouseButtonHook.IsNull)
+            {
+                App.logger.Debug("UnhookWindowsHookEx (mouse button hook)");
+                Vanara.PInvoke.User32.UnhookWindowsHookEx(MouseButtonHook); // SafeHHOOK → HHOOK implicit
+                MouseButtonHook = null;
+            }
         }
 
         #endregion hook lifecycle
 
         #region hook callback
+
+        /// <summary>
+        /// Passive WH_MOUSE_LL callback: timestamps physical button-downs so the
+        /// foreground callback can tell click-caused switches from gesture-caused
+        /// ones. Never interferes with input — always CallNextHookEx.
+        /// </summary>
+        private IntPtr MouseButtonHookProc(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            const int WM_LBUTTONDOWN = 0x0201;
+            const int WM_RBUTTONDOWN = 0x0204;
+            const int WM_MBUTTONDOWN = 0x0207;
+            const int WM_XBUTTONDOWN = 0x020B;
+            if (nCode >= 0)
+            {
+                int msg = unchecked((int)wParam.ToInt64());
+                if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN || msg == WM_XBUTTONDOWN)
+                    LastMouseButtonDownUtc = System.DateTime.UtcNow;
+            }
+            // hhk of CallNextHookEx is ignored by the system; pass a null handle.
+            return Vanara.PInvoke.User32.CallNextHookEx(new Vanara.PInvoke.User32.HHOOK(IntPtr.Zero), nCode, wParam, lParam);
+        }
 
         /// <summary>
         /// Win32 event hook callback (fires on the hook thread, not the UI thread).
@@ -260,6 +315,20 @@ namespace MousePointerReposition
                         && (RepositioningTimer.Enabled || IsMousePositioningTriggered))
                     {
                         App.logger.Debug("ForegroundEvent: skipped (keyboard-path repositioning in flight)");
+                        return;
+                    }
+
+                    // Click-suppression: the foreground change was caused by a recent
+                    // mouse/touchpad button click (window close/minimize button,
+                    // taskbar icon, clicking another window) — the cursor is already
+                    // where the user put it; do not move it. Gesture switches produce
+                    // no button events and are unaffected. Known trade-off: a gesture
+                    // within MouseClickSuppressMs after a click is also skipped
+                    // (rare; self-heals on the next gesture).
+                    if (MouseButtonHook != null && !MouseButtonHook.IsNull
+                        && (System.DateTime.UtcNow - LastMouseButtonDownUtc).TotalMilliseconds < MouseClickSuppressMs)
+                    {
+                        App.logger.Debug("ForegroundEvent: skipped (recent mouse click)");
                         return;
                     }
                     // Stage 2 (MarshalOnly): prove the dispatcher round-trip survives,
