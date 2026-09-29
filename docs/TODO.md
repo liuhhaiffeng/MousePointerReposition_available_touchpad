@@ -64,12 +64,17 @@
 
 **触发条件**：桶内 ≥3 个未解决场景，或出现 1 个高严重度（跨屏拽走级）场景。
 
+**状态：已执行批处理（2026-09-29）**。场景 #3（三指上滑开 Task View 跨屏拽光标）达成触发条件，按上述方向实施类名+宿主进程过滤。过滤器集合见 `MainWindowVM.Touchpad.cs` 的 `ShellTransientClasses` / `ShellHostProcesses`；若登记新场景，优先考虑扩充这两个集合。
+
 ### 场景登记
 
 | # | 日期 | 场景 | 严重度 | 日志证据 | 指纹 |
 |---|------|------|--------|---------|------|
 | 1 | 2026-09-28 | 任务栏图标右键开跳转列表：菜单本体在点击后 575ms 才成为前台，越过 500ms 点击窗 → 跳到菜单中心 | 低（短跳，目标即注意力所在） | 17:47:58.54 右键拦截 ✓ → 17:47:59.11 `triggering (lastClick=586ms)` → New window (72,513 479×915) | `Windows.UI.Core.CoreWindow`（hwnd 0xA123E） |
 | 2 | 2026-09-28 | 托盘通知闪烁 churn（已由 v3.6 静止门解决，作为同类根因参考入档） | 高（已解决） | toast/`Shell_TrayWnd`/托盘溢出窗口 20ms 级互切 | `CoreWindow` + `TopLevelWindowForOverflowXamlIsland` |
+| 3 | 2026-09-29 | 三指上滑开 Task View：`ForegroundStaging`→`XamlExplorerHostIslandWindow` 编排事件链，光标从左屏 (-2472,2307) 被拽到主屏中心 | **高（跨屏拽走）** | 10:03:43.270 staging 触发 → 10:03:43.728 New window (0,0 2560×1600) 全屏 Task View | `ForegroundStaging` + `XamlExplorerHostIslandWindow` |
+
+**批处理结果（v3.8）**：shell 瞬态 UI 过滤器上线，三个场景的指纹类名全部覆盖。继续登记新场景，下次触发时再评估扩充集合。
 
 ---
 

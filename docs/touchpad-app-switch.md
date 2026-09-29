@@ -788,6 +788,7 @@ TC-E-4  ☐ 通过 ☐ 失败  备注: ___________
 | v3.5 | 可观测性 | 决策点证据日志：skip/trigger 行携带输入身份+距今时间+阈值（commit `e784a36`）；新增"人工验证 → 日志对照表"，人工验证结果机械可核对 |
 | v3.6 | UX 优化 | 光标静止门：通知 churn 等**光标移动中**的前台变更不再拽走光标（`WM_MOUSEMOVE` 时间戳 + 250ms 窗口，commit `e3ec6f8`）；前台路径四道闸成型（消重/点击/键盘近因/静止门） |
 | v3.7 | 观测 + 治理 | 前台事件入口日志携带 `class=`（纯观测零行为变化）；确立边缘场景**批处理策略**——shell 瞬态 UI 场景共享根因（`CoreWindow` + shell 宿主进程），新场景只登记入 `docs/TODO.md` TODO-3 收集桶，不逐个改代码 |
+| v3.8 | UX 优化 | **TODO-3 批处理执行**：shell 瞬态 UI 过滤器（类名 + 宿主进程，入口层），一次解决 Task View/切换器/toast/跳转列表/托盘飞出/桌面整类；指纹集合见 `ShellTransientClasses`/`ShellHostProcesses` |
 
 ## 控制实验 — v1.3 键盘路径 vs 触控板 hook 路径
 
@@ -1069,10 +1070,11 @@ Win+Shift+方向键后连续手势正常跨屏跟随（零 skipped）；Alt+Tab 
 - 启动较慢的新窗口（按键后 >1s 才成为前台）仍可能触发跳变——近因窗口无法覆盖任意长的启动延迟
 - 无输入的自发前台变更（通知弹窗、安装程序完成自弹）仍会触发移动——v1 设计即接受
 
-### 触发判定全景（v3.4 起）
+### 触发判定全景（v3.8 起）
 
 | 切换来源 | 前台路径行为 | 拦截层 |
 |---------|-------------|--------|
+| **shell 瞬态 UI**（任务视图/切换器/toast/跳转列表/托盘飞出/任务栏/桌面） | 跳过 | 类名+宿主进程过滤（v3.8，入口层） |
 | 三指滑动手势 | **移动光标**（唯一放行） | — |
 | Alt+Tab / Win+方向键 | 跳过（键盘路径自行处理） | 消重 + 键盘近因（双保险） |
 | Win 键 / Win+E / 其他键盘动作 | 跳过 | 键盘近因（1s） |
@@ -1100,6 +1102,7 @@ Win+Shift+方向键后连续手势正常跨屏跟随（零 skipped）；Alt+Tab 
 | 三指手势 | `triggering mouse positioning (..., lastKey=XXms, lastClick=XXms, lastMove=XXms)` —— **三者均超阈值（或 never）即证明放行正确** |
 | 手势被误杀（bug 上报时） | skip 行的时间差直接区分：真刚输入过（正确拦截）vs 时间戳异常（bug） |
 | 移动鼠标途中发生前台变更 | `skipped (cursor in motion: XXms ago < 250ms)` |
+| 三指上滑开任务视图 / 下滑显示桌面 | `skipped (shell transient UI)` |
 
 ## UX 优化：光标静止门（v3.6）
 
@@ -1132,6 +1135,22 @@ Win11 托盘图标闪烁（消息通知）+ toast 弹窗引发**前台自发 chu
 
 - 触控板"先单指挪位、<250ms 内紧接甩手势"的首次手势被吞，再滑自愈
 - 光标完全静止时的自发前台变更仍会跳（v1 设计即接受，本次不动）
+
+## UX 优化：shell 瞬态 UI 过滤器（v3.8）—— TODO-3 批处理执行
+
+> 2026-09-29 实施。触发：场景 #3（三指上滑开 Task View，光标从左屏被拽到主屏中心）满足 TODO-3 的批处理条件。
+
+### 问题
+
+三指**上滑**（Task View）/ 下滑（显示桌面）在四道闸眼里与左右滑完全同构（无输入、光标静止）→ 全放行。Task View 的开关编排产生 `ForegroundStaging` → `XamlExplorerHostIslandWindow` 事件链，每条都触发重定位 → "乱跳"，含跨屏拽走。
+
+### 修复：类名 + 宿主进程过滤（回调入口处，marshal 之前）
+
+- **无条件过滤**（必是 shell 表面）：`XamlExplorerHostIslandWindow` / `ForegroundStaging` / `TopLevelWindowForOverflowXamlIsland` / `NotifyIconOverflowWindow` / `Shell_TrayWnd` / `Shell_SecondaryTrayWnd` / `Progman` / `WorkerW`
+- **宿主进程过滤**：`Windows.UI.Core.CoreWindow` 仅当宿主进程 ∈ {explorer, ShellExperienceHost, StartMenuExperienceHost, SearchHost, TextInputHost}（保护正常 UWP 应用——其顶层窗口通常是 `ApplicationFrameWindow`，双保险）
+- 过滤器在 hwnd 去重**之前**执行：shell 表面永远不会成为 `LastForegroundHwnd`，不污染手势切换的去重状态
+
+对既有路径零影响：Alt+Tab 走键盘路径；左右滑手势的目标是正常应用窗口。
 
 ## 现状与建议（v3.1 更新）
 
@@ -1187,6 +1206,7 @@ git diff master -- MousePointerReposition/MainWindowVM.cs
 5. **点击窗口关闭/最小化按钮、点任务栏图标：光标不得跳变**（v3.3 点击抑制）；点击 0.5s 后手势恢复正常
 6. **按 Win 键开开始菜单、Win+E 开新窗口：光标不得跳变**（v3.4 键盘近因抑制）；打字 1s 后手势恢复正常
 7. **移动光标途中（如移向闪烁的托盘图标）前台变更：光标不得被拽走**（v3.6 静止门）；静止 0.25s 后手势恢复正常
+8. **三指上滑开任务视图、下滑显示桌面、Win+Tab：光标不得跳变**（v3.8 shell 过滤器）；任务视图里点选窗口正常工作；手势切换到正常 UWP 应用（设置/计算器等）仍应跟随
 
 ### 第三层：流程纪律（隔离优先，合并靠后）
 
