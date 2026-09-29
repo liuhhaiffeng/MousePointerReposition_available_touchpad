@@ -112,6 +112,29 @@ namespace MousePointerReposition
         private System.DateTime LastKeyboardActivityUtc; // UI thread only
         private uint LastKeyboardVk; // vkCode of the last key event — same decision-evidence purpose
 
+        // Transient shell UI filter (TODO-3 batch): surfaces whose foreground
+        // transitions are shell open/close choreography, never user app-switches.
+        // Unambiguous shell classes are filtered outright; CoreWindow additionally
+        // requires a shell host process because legit UWP app windows share it
+        // (their top-level is usually ApplicationFrameWindow, but be safe).
+        private static readonly System.Collections.Generic.HashSet<string> ShellTransientClasses =
+            new System.Collections.Generic.HashSet<string>(System.StringComparer.Ordinal)
+            {
+                "XamlExplorerHostIslandWindow",        // Win11 Task View / app switcher / snap assist
+                "ForegroundStaging",                   // switcher transition staging window
+                "TopLevelWindowForOverflowXamlIsland", // tray overflow flyout
+                "NotifyIconOverflowWindow",            // legacy tray overflow
+                "Shell_TrayWnd",                       // taskbar
+                "Shell_SecondaryTrayWnd",              // secondary-monitor taskbars
+                "Progman", "WorkerW",                  // desktop (e.g. three-finger swipe down)
+            };
+
+        private static readonly System.Collections.Generic.HashSet<string> ShellHostProcesses =
+            new System.Collections.Generic.HashSet<string>(System.StringComparer.OrdinalIgnoreCase)
+            {
+                "explorer", "shellexperiencehost", "startmenuexperiencehost", "searchhost", "textinputhost"
+            };
+
         /// <summary>Formats a UTC timestamp as an age string for decision-point diagnostics.</summary>
         private static string FormatAgeUtc(System.DateTime utc)
         {
@@ -300,6 +323,23 @@ namespace MousePointerReposition
             return Vanara.PInvoke.User32.CallNextHookEx(new Vanara.PInvoke.User32.HHOOK(IntPtr.Zero), nCode, wParam, lParam);
         }
 
+        private bool IsShellTransientUi(Vanara.PInvoke.HWND hwnd, string className)
+        {
+            if (string.IsNullOrEmpty(className))
+                return false;
+            if (ShellTransientClasses.Contains(className))
+                return true;
+            if (className != "Windows.UI.Core.CoreWindow")
+                return false;
+            try
+            {
+                uint pid;
+                Vanara.PInvoke.User32.GetWindowThreadProcessId(hwnd, out pid);
+                return ShellHostProcesses.Contains(System.Diagnostics.Process.GetProcessById((int)pid).ProcessName);
+            }
+            catch { return false; } // window/process already gone — treat as normal
+        }
+
         /// <summary>
         /// Win32 event hook callback (fires on the hook thread, not the UI thread).
         /// Filters out self-window and dedupes rapid foreground churn, then
@@ -350,6 +390,16 @@ namespace MousePointerReposition
                         App.logger.Debug("ForegroundEventCallback: self window, skip");
                         return;
                     }
+                }
+
+                // Transient shell UI filter (TODO-3 batch): three-finger swipe UP opens
+                // Task View, whose ForegroundStaging → XamlExplorerHostIslandWindow
+                // choreography yanked the cursor cross-screen to its center. Runs before
+                // the hwnd dedupe so shell surfaces never become LastForegroundHwnd.
+                if (IsShellTransientUi(hwnd, className))
+                {
+                    App.logger.Debug("ForegroundEventCallback: skipped (shell transient UI)");
+                    return;
                 }
 
                 // dedupe rapid foreground churn on the SAME hwnd (e.g. spurious refires)
