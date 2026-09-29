@@ -316,7 +316,21 @@ namespace MousePointerReposition
             uint idEventThread,
             uint dwmsEventTime)
         {
-            App.logger.Debug($"ForegroundEventCallback: eventId=0x{eventId:X4} hwnd=0x{(hwnd.IsNull ? 0L : ((IntPtr)hwnd).ToInt64()):X}");
+            // Resolve the window class for diagnostics (pure observability — no behavior
+            // change). Transient shell UI (toasts, jump lists, tray flyouts) shares the
+            // class Windows.UI.Core.CoreWindow with legit UWP app windows; capturing the
+            // class on every event lets the pending batch analysis (docs/TODO.md → 前台
+            // 路径 UX 边缘场景) separate them by host process without re-running repros.
+            // GetClassName reads window-manager data and sends no messages — safe here.
+            string className = "";
+            if (!hwnd.IsNull)
+            {
+                var cls = new System.Text.StringBuilder(256);
+                if (Vanara.PInvoke.User32.GetClassName(hwnd, cls, cls.Capacity) > 0)
+                    className = cls.ToString();
+            }
+
+            App.logger.Debug($"ForegroundEventCallback: eventId=0x{eventId:X4} hwnd=0x{(hwnd.IsNull ? 0L : ((IntPtr)hwnd).ToInt64()):X} class={className}");
 
             // Note: EVENT_SYSTEM_SWITCHSTART/SWITCHEND are never emitted by Win11 (zero
             // occurrences across all captured logs) and we no longer hook that range;
